@@ -1,18 +1,16 @@
 """
-Scraper for r/AIBubble using old.reddit.com (no API key needed).
+Scraper for r/AIBubble and r/AIMain using old.reddit.com (no API key needed).
 
-Collects posts + top comments to reach 200-300 labeled examples.
+Collects text-based posts from both subreddits.
 - Skips image/video posts (i.redd.it, i.imgur.com, etc.)
-- Keeps link posts (article URLs) — these become the `articles` label
-- Pulls up to MAX_COMMENTS_PER_POST substantive comments per post
-- Substantive = >= MIN_COMMENT_CHARS characters and not deleted/removed
+- Keeps link posts (article URLs) and embeds the URL in the text field
+- No comments — posts only, to maximize unique examples
 
 Usage:
     python scrape.py
 
 Output:
     dataset_raw.csv  — columns: type, id, url, text, label, notes
-    type = 'post' or 'comment'
     Fill in 'label' and 'notes' during annotation.
 
 Requires:
@@ -27,12 +25,10 @@ import requests
 from bs4 import BeautifulSoup
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SUBREDDIT             = "AIBubble"
-OUTPUT_FILE           = "dataset_raw.csv"
-DELAY                 = 1.5    # seconds between requests
-MAX_COMMENTS_PER_POST = 4      # max substantive comments to pull per post
-MIN_COMMENT_CHARS     = 100    # minimum characters for a comment to be kept
-TARGET                = 280    # stop collecting once we hit this many rows
+SUBREDDITS  = ["AIBubble", "AIMain"]
+OUTPUT_FILE = "dataset_raw.csv"
+DELAY       = 2.5    # seconds between requests
+TARGET      = 300    # stop collecting once we hit this many rows total
 
 BASE    = "https://old.reddit.com"
 HEADERS = {
@@ -78,89 +74,85 @@ def init_session():
 # ── HTTP ───────────────────────────────────────────────────────────────────────
 
 def get(url):
-    time.sleep(DELAY)
-    r = SESSION.get(url, timeout=20)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
+    for attempt in range(4):
+        time.sleep(DELAY * (2 ** attempt))   # 2.5 → 5 → 10 → 20 s on retries
+        try:
+            r = SESSION.get(url, timeout=20)
+            if r.status_code == 429:
+                wait = 30 + 30 * attempt
+                print(f"    Rate-limited — sleeping {wait}s…")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "html.parser")
+        except Exception as e:
+            if attempt == 3:
+                raise
+            print(f"    Retry {attempt+1}: {e}")
+    raise RuntimeError(f"Failed to fetch {url}")
 
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 
 def is_image_post(domain, url):
-    """Return True for posts whose content is purely image/video."""
     if domain in IMAGE_DOMAINS:
         return True
     if url.lower().split("?")[0].endswith(IMAGE_EXTS):
         return True
-    # imgur.com direct links without /a/ (albums) are usually single images
     if domain == "imgur.com" and "/a/" not in url and "/gallery/" not in url:
         return True
     return False
 
 
-def is_substantive_comment(text):
-    """Return True if a comment is worth keeping."""
-    if not text or text in ("[deleted]", "[removed]"):
-        return False
-    # Strip whitespace and check length
-    clean = " ".join(text.split())
-    return len(clean) >= MIN_COMMENT_CHARS
-
-
 # ── Parsers ────────────────────────────────────────────────────────────────────
 
-def build_text(title, body=""):
+def build_text(title, body="", article_url=""):
+    """Build the text field: title + optional article URL + optional body."""
     parts = [title.strip()]
+    if article_url:
+        parts.append(article_url)
     body = (body or "").strip()
     if body and body not in ("[deleted]", "[removed]"):
         parts.append(body)
     return "\n\n".join(parts).strip()
 
 
-def parse_comments(soup):
-    """Return a list of substantive top-level comment texts from a post page."""
-    comments = []
-    for div in soup.select("div.commentarea div.thing.comment"):
-        body_el = div.select_one("div.usertext-body div.md")
-        if not body_el:
-            continue
-        text = body_el.get_text(separator="\n").strip()
-        if is_substantive_comment(text):
-            comments.append(text)
-        if len(comments) >= MAX_COMMENTS_PER_POST:
-            break
-    return comments
-
-
 def fetch_post_page(permalink):
-    """Fetch a post page and return (title, body, comments)."""
     try:
         soup = get(BASE + permalink)
     except Exception as e:
         print(f"    Could not fetch {permalink}: {e}")
-        return "", "", []
+        return "", "", ""
 
     title_el = soup.select_one("a.title")
     title    = title_el.get_text().strip() if title_el else ""
     body_el  = soup.select_one("div.expando div.usertext-body div.md")
     body     = body_el.get_text(separator="\n").strip() if body_el else ""
-    comments = parse_comments(soup)
-    return title, body, comments
+    thing_el = soup.select_one("div.thing[data-url]")
+    link_url = thing_el.get("data-url", "") if thing_el else ""
+    return title, body, link_url
 
 
 def fetch_linked_post_text(url_field):
-    """If url_field is a Reddit post link, return its text. Otherwise ''."""
+    """If url_field is a Reddit post URL, return its full text (title + article URL + body)."""
     if not REDDIT_POST_RE.match(url_field or ""):
         return ""
     permalink = re.sub(r"^https?://[^/]+", "", url_field)
-    title, body, _ = fetch_post_page(permalink)   # don't pull comments from linked posts
-    return build_text(title, body)
+    title, body, link_url = fetch_post_page(permalink)
+    is_self = link_url and (
+        re.sub(r"^https?://[^/]+", "", link_url).rstrip("/") == permalink.rstrip("/")
+    )
+    article_url = ""
+    if link_url and not is_self and not REDDIT_POST_RE.match(link_url):
+        domain = link_url.split("/")[2] if link_url.startswith("http") else ""
+        if not is_image_post(domain, link_url):
+            article_url = link_url
+    return build_text(title, body, article_url)
 
 
 # ── Listing ────────────────────────────────────────────────────────────────────
 
 def iter_listing(subreddit, feed):
-    """Yield post metadata dicts from a feed listing page."""
     if feed == "top":
         url = f"{BASE}/r/{subreddit}/top/?t=all&limit=100"
     elif feed == "controversial":
@@ -169,7 +161,7 @@ def iter_listing(subreddit, feed):
         url = f"{BASE}/r/{subreddit}/{feed}/?limit=100"
 
     while url:
-        print(f"  Listing: {url.split('reddit.com')[-1]}")
+        print(f"  Listing: {url.split('reddit.com')[-1][:80]}")
         try:
             soup = get(url)
         except Exception as e:
@@ -190,78 +182,84 @@ def iter_listing(subreddit, feed):
                        "link_url": link_url, "domain": domain}
 
         nxt = soup.select_one("span.next-button a")
-        url = (BASE + nxt["href"]) if nxt else None
+        if nxt:
+            href = nxt["href"]
+            # href may be absolute (https://old.reddit.com/...) or relative (/r/...)
+            url = href if href.startswith("http") else BASE + href
+        else:
+            url = None
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def scrape(subreddit):
-    feeds   = ("top", "hot", "controversial", "new", "rising")
-    seen    = set()
-    rows    = []
+def scrape(subreddits):
+    feeds = ("top", "hot", "controversial", "new", "rising")
+    seen  = set()
+    rows  = []
 
-    for feed in feeds:
-        if len(rows) >= TARGET:
-            print(f"\nReached {TARGET} rows — done.")
-            break
+    for subreddit in subreddits:
+        print(f"\n{'='*50}")
+        print(f"  r/{subreddit}")
+        print(f"{'='*50}")
 
-        print(f"\n-- {feed.upper()} --------------------------")
-
-        for post in iter_listing(subreddit, feed):
+        for feed in feeds:
             if len(rows) >= TARGET:
-                break
+                print(f"\nReached {TARGET} rows -- done.")
+                return rows
 
-            pid = post["id"]
-            if pid in seen:
-                continue
-            seen.add(pid)
+            print(f"\n-- {feed.upper()} --------------------------")
 
-            # Skip image/video posts
-            if is_image_post(post["domain"], post["link_url"]):
-                print(f"  [skip image] {post['link_url'][:70]}")
-                continue
-
-            # Fetch page (post body + comments in one request)
-            title, body, comments = fetch_post_page(post["permalink"])
-            if not title:
-                continue
-
-            text = build_text(title, body)
-
-            # Append linked Reddit post text if applicable
-            linked = post["link_url"]
-            if linked and REDDIT_POST_RE.match(linked):
-                norm_linked = re.sub(r"^https?://[^/]+", "", linked).rstrip("/")
-                if norm_linked.rstrip("/") != post["permalink"].rstrip("/"):
-                    linked_text = fetch_linked_post_text(linked)
-                    if linked_text:
-                        text += "\n\n---\n[Linked Post]\n" + linked_text
-                        print(f"    Linked post appended")
-
-            # Add post row
-            rows.append({
-                "type":  "post",
-                "id":    pid,
-                "url":   BASE + post["permalink"],
-                "text":  text,
-                "label": "",
-                "notes": "",
-            })
-            print(f"  [{len(rows):>3}/{TARGET}] POST: {title[:60]}")
-
-            # Add comment rows
-            for i, comment_text in enumerate(comments):
+            for post in iter_listing(subreddit, feed):
                 if len(rows) >= TARGET:
                     break
+
+                pid = post["id"]
+                if pid in seen:
+                    continue
+                seen.add(pid)
+
+                if is_image_post(post["domain"], post["link_url"]):
+                    print(f"  [skip image] {post['link_url'][:70]}")
+                    continue
+
+                title, body, _ = fetch_post_page(post["permalink"])
+                if not title:
+                    continue
+
+                # Determine whether the link_url is an external article or another Reddit post
+                linked = post["link_url"]
+                is_reddit_link = bool(REDDIT_POST_RE.match(linked or ""))
+                is_self_link   = linked and (
+                    re.sub(r"^https?://[^/]+", "", linked).rstrip("/")
+                    == post["permalink"].rstrip("/")
+                )
+
+                article_url  = ""
+                linked_text  = ""
+
+                if linked and not is_reddit_link and not is_self_link:
+                    # External article/URL — embed it in the text
+                    article_url = linked
+                elif is_reddit_link and not is_self_link:
+                    # Links to another Reddit post — fetch that post's full content
+                    linked_text = fetch_linked_post_text(linked)
+                    if linked_text:
+                        print(f"    Embedded Reddit post fetched")
+
+                orig_text = build_text(title, body, article_url)
+                # Embedded post content goes first; original post content follows
+                text = (linked_text + "\n\n---\n[Original Post]\n" + orig_text
+                        if linked_text else orig_text)
+
                 rows.append({
-                    "type":  "comment",
-                    "id":    f"{pid}_c{i}",
+                    "type":  "post",
+                    "id":    pid,
                     "url":   BASE + post["permalink"],
-                    "text":  comment_text,
+                    "text":  text,
                     "label": "",
                     "notes": "",
                 })
-                print(f"  [{len(rows):>3}/{TARGET}]   comment ({len(comment_text)} chars)")
+                print(f"  [{len(rows):>3}/{TARGET}] {subreddit}: {title[:60]}")
 
     return rows
 
@@ -272,12 +270,10 @@ def save_csv(rows, path):
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    posts    = sum(1 for r in rows if r["type"] == "post")
-    comments = sum(1 for r in rows if r["type"] == "comment")
-    print(f"\nSaved {len(rows)} rows ({posts} posts + {comments} comments) -> {path}")
+    print(f"\nSaved {len(rows)} rows -> {path}")
 
 
 if __name__ == "__main__":
     init_session()
-    rows = scrape(SUBREDDIT)
+    rows = scrape(SUBREDDITS)
     save_csv(rows, OUTPUT_FILE)
